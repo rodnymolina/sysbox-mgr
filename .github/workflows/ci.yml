@@ -1,0 +1,98 @@
+# Build, vet and unit-test sysbox-mgr on every pull request.
+#
+# sysbox-mgr can't build on its own: its go.mod replaces the other Sysbox
+# modules with sibling directories (e.g., ../sysbox-ipc). So this workflow
+# checks out the pull request next to the current heads of those repos,
+# which is the same layout the sysbox superproject uses.
+
+name: ci
+
+on:
+  pull_request:
+    paths-ignore:
+      - "**/*.md"
+      - "docs/**"
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  unit:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    steps:
+      # The pull request under test.
+      - uses: actions/checkout@v4
+        with:
+          path: sysbox-mgr
+
+      # Sibling repos that sysbox-mgr's go.mod points at. They are taken at
+      # their default branch, i.e., what the next superproject bump would use.
+      - uses: actions/checkout@v4
+        with:
+          repository: nestybox/sysbox-ipc
+          path: sysbox-ipc
+      - uses: actions/checkout@v4
+        with:
+          repository: nestybox/sysbox-libs
+          path: sysbox-libs
+      - uses: actions/checkout@v4
+        with:
+          repository: nestybox/sysbox-runc
+          path: sysbox-runc
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: sysbox-mgr/go.mod
+          cache-dependency-path: sysbox-mgr/go.sum
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libseccomp-dev pkg-config rsync unzip
+
+      # The sysbox-ipc gRPC code is generated at build time. Use the same
+      # protoc version as the Sysbox test and packaging images.
+      - name: Install protoc and its Go plugins
+        run: |
+          curl -sSL -o /tmp/protoc.zip \
+            https://github.com/protocolbuffers/protobuf/releases/download/v3.15.8/protoc-3.15.8-linux-x86_64.zip
+          sudo unzip -q -o /tmp/protoc.zip -d /usr/local bin/protoc 'include/*'
+          sudo chmod 755 /usr/local/bin/protoc
+          sudo chmod -R a+rX /usr/local/include/google
+          go install github.com/golang/protobuf/protoc-gen-go@v1.5.4
+          go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@v1.5.1
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+
+      - name: Generate the sysbox-ipc protobuf code
+        run: |
+          make -C sysbox-ipc/sysboxFsGrpc/sysboxFsProtobuf
+          make -C sysbox-ipc/sysboxMgrGrpc/sysboxMgrProtobuf
+
+      - name: Build
+        working-directory: sysbox-mgr
+        env:
+          CGO_ENABLED: "1"
+        run: go build -buildvcs=false -tags "idmapped_mnt netgo osusergo" ./...
+
+      # The unkeyed-fields check is off because the existing code builds
+      # formatter.ContainerID values that way in many places.
+      - name: Vet
+        working-directory: sysbox-mgr
+        run: go vet -buildvcs=false -composites=false ./...
+
+      # Some of the tests create mounts, so they must run as root. The
+      # shiftfsMgr tests are left out: they need a shiftfs-capable kernel and
+      # a scratch directory that only the Sysbox test container provides.
+      - name: Unit tests
+        working-directory: sysbox-mgr
+        run: |
+          pkgs=$(go list -buildvcs=false ./... | grep -v '/shiftfsMgr$')
+          sudo -E env "PATH=$PATH" "HOME=$HOME" \
+            go test -buildvcs=false -timeout 10m $pkgs
