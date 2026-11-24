@@ -87,9 +87,12 @@ jobs:
         working-directory: sysbox-mgr
         run: go vet -buildvcs=false -composites=false ./...
 
-      # Some of the tests create mounts, so they must run as root.
+      # Some of the tests create mounts, so they must run as root. The
+      # shiftfsMgr tests are left out: they need a shiftfs-capable kernel and
+      # a scratch directory that only the Sysbox test container provides.
       - name: Unit tests
         working-directory: sysbox-mgr
         run: |
+          pkgs=$(go list -buildvcs=false ./... | grep -v '/shiftfsMgr$')
           sudo -E env "PATH=$PATH" "HOME=$HOME" \
-            go test -buildvcs=false -timeout 10m ./...
+            go test -buildvcs=false -timeout 10m $pkgs
